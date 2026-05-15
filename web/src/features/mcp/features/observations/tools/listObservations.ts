@@ -1,9 +1,18 @@
 import { SpanKind } from "@opentelemetry/api";
 import {
   OBSERVATION_MCP_ALLOWED_EVENTS_TABLE_FILTER_COLUMNS,
+  arrayOptionsFilter,
+  booleanFilter,
+  eventsTableCols,
+  numberFilter,
   ObservationLevelDomain,
   ObservationTypeDomain,
   singleFilter,
+  stringFilter,
+  stringObjectFilter,
+  stringOptionsFilter,
+  timeFilter,
+  type ColumnDefinition,
 } from "@langfuse/shared";
 import {
   getObservationsV2FromEventsTableForPublicApi,
@@ -15,6 +24,7 @@ import {
   EncodedObservationsCursorV2String,
   encodeCursor,
 } from "@/src/features/public-api/types/observations";
+import { UserInputError } from "../../../core/errors";
 import { defineTool } from "../../../core/define-tool";
 import {
   ExpandMetadataKeysSchema,
@@ -29,6 +39,107 @@ import {
 const ObservationCursorSchema =
   EncodedObservationsCursorV2String.optional().describe(
     "Cursor returned by a previous listObservations call",
+  );
+
+const OBSERVATION_MCP_FILTER_COLUMN_TYPES = new Map(
+  eventsTableCols
+    .filter((column) =>
+      OBSERVATION_MCP_ALLOWED_EVENTS_TABLE_FILTER_COLUMNS.has(column.id),
+    )
+    .map((column) => [
+      column.id === "traceTags" ? "tags" : column.id,
+      column.type,
+    ]),
+);
+
+const OBSERVATION_MCP_FILTER_COLUMN_DEFINITIONS = eventsTableCols
+  .filter((column) =>
+    OBSERVATION_MCP_ALLOWED_EVENTS_TABLE_FILTER_COLUMNS.has(column.id),
+  )
+  .map((column) => ({
+    column: column.id === "traceTags" ? "tags" : column.id,
+    type: column.type,
+  }));
+
+const OBSERVATION_MCP_FILTER_EXAMPLE = {
+  column: "totalCost",
+  operator: ">",
+  value: 0.0029,
+} satisfies Omit<z.infer<typeof numberFilter>, "type">;
+const OBSERVATION_MCP_FILTER_EXAMPLE_WITH_TYPE = {
+  type: "number",
+  ...OBSERVATION_MCP_FILTER_EXAMPLE,
+} satisfies z.infer<typeof numberFilter>;
+const OBSERVATION_MCP_FILTER_EXAMPLE_JSON = JSON.stringify(
+  OBSERVATION_MCP_FILTER_EXAMPLE,
+);
+const OBSERVATION_MCP_FILTER_EXAMPLE_WITH_TYPE_JSON = JSON.stringify(
+  OBSERVATION_MCP_FILTER_EXAMPLE_WITH_TYPE,
+);
+
+const observationMcpFilterSchemaByType = {
+  datetime: (column: string) =>
+    timeFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("datetime").optional(),
+      column: z.literal(column),
+    }),
+  string: (column: string) =>
+    stringFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("string").optional(),
+      column: z.literal(column),
+    }),
+  stringOptions: (column: string) =>
+    stringOptionsFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("stringOptions").optional(),
+      column: z.literal(column),
+    }),
+  arrayOptions: (column: string) =>
+    arrayOptionsFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("arrayOptions").optional(),
+      column: z.literal(column),
+    }),
+  number: (column: string) =>
+    numberFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("number").optional(),
+      column: z.literal(column),
+    }),
+  stringObject: (column: string) =>
+    stringObjectFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("stringObject").optional(),
+      column: z.literal(column),
+    }),
+  boolean: (column: string) =>
+    booleanFilter.omit({ type: true, column: true }).extend({
+      type: z.literal("boolean").optional(),
+      column: z.literal(column),
+    }),
+} satisfies Partial<
+  Record<ColumnDefinition["type"], (column: string) => z.ZodType>
+>;
+
+type ObservationMcpFilterType = keyof typeof observationMcpFilterSchemaByType;
+
+const isObservationMcpFilterType = (
+  type: string,
+): type is ObservationMcpFilterType => type in observationMcpFilterSchemaByType;
+
+const observationMcpFilterSchemas =
+  OBSERVATION_MCP_FILTER_COLUMN_DEFINITIONS.flatMap(({ column, type }) =>
+    isObservationMcpFilterType(type)
+      ? [observationMcpFilterSchemaByType[type](column)]
+      : [],
+  );
+
+const ObservationMcpFilterSchema = z
+  .union(
+    observationMcpFilterSchemas as [
+      (typeof observationMcpFilterSchemas)[number],
+      (typeof observationMcpFilterSchemas)[number],
+      ...(typeof observationMcpFilterSchemas)[number][],
+    ],
+  )
+  .describe(
+    `Advanced observation filter object. Example: ${OBSERVATION_MCP_FILTER_EXAMPLE_JSON}. The explicit form ${OBSERVATION_MCP_FILTER_EXAMPLE_WITH_TYPE_JSON} is also accepted.`,
   );
 
 const ListObservationsBaseSchema = z.object({
@@ -47,27 +158,77 @@ const ListObservationsBaseSchema = z.object({
   fromStartTime: z.iso.datetime({ offset: true }).optional(),
   toStartTime: z.iso.datetime({ offset: true }).optional(),
   filter: z
-    .array(singleFilter)
+    .array(ObservationMcpFilterSchema)
+    .optional()
+    .describe(
+      "Advanced filters. Each item must be an object with column, operator, value, and optional type. Type is inferred from getObservationFilterSchema columns when omitted.",
+    ),
+});
+
+const ListObservationsInputSchema = ListObservationsBaseSchema.extend({
+  filter: z
+    .array(z.unknown())
     .optional()
     .superRefine((filters, ctx) => {
       if (!filters) return;
 
       filters.forEach((filter, index) => {
-        if (filter.column === "tags") return;
-        if (filter.column !== "traceTags") {
-          for (const allowedColumn of OBSERVATION_MCP_ALLOWED_EVENTS_TABLE_FILTER_COLUMNS) {
-            if (allowedColumn === filter.column) return;
-          }
+        if (
+          typeof filter !== "object" ||
+          filter === null ||
+          Array.isArray(filter)
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            path: [index],
+            message: `Each filter must be an object, for example ${OBSERVATION_MCP_FILTER_EXAMPLE_JSON}. String filters are not supported.`,
+          });
+          return;
         }
 
-        ctx.addIssue({
-          code: "custom",
-          path: [index, "column"],
-          message: `Invalid observation filter column "${filter.column}". Call getObservationFilterSchema for accepted columns.`,
-        });
+        const filterRecord = filter as Record<string, unknown>;
+        const column = filterRecord.column;
+        if (typeof column !== "string") return;
+
+        if (!OBSERVATION_MCP_FILTER_COLUMN_TYPES.has(column)) {
+          ctx.addIssue({
+            code: "custom",
+            path: [index, "column"],
+            message: `Invalid observation filter column "${column}". Call getObservationFilterSchema for accepted columns.`,
+          });
+          return;
+        }
+
+        const filterWithInferredType = {
+          ...filterRecord,
+          type:
+            filterRecord.type ??
+            OBSERVATION_MCP_FILTER_COLUMN_TYPES.get(column),
+        };
+
+        const parsedFilter = singleFilter.safeParse(
+          column === "tags"
+            ? { ...filterWithInferredType, column: "traceTags" }
+            : filterWithInferredType,
+        );
+
+        if (!parsedFilter.success) {
+          ctx.addIssue({
+            code: "custom",
+            path: [index],
+            message:
+              `Invalid ${column} filter. Expected an object matching getObservationFilterSchema; for example ` +
+              `${OBSERVATION_MCP_FILTER_EXAMPLE_WITH_TYPE_JSON}. ` +
+              parsedFilter.error.issues
+                .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+                .join(", "),
+          });
+        }
       });
     }),
 });
+
+type ListObservationsInput = z.infer<typeof ListObservationsInputSchema>;
 
 export const [listObservationsTool, handleListObservations] = defineTool({
   name: "listObservations",
@@ -77,8 +238,8 @@ export const [listObservationsTool, handleListObservations] = defineTool({
     "",
     'By default this returns compact summary fields. Use fields: ["*"] for the full observation, or pass specific field names to limit the response size.',
   ].join("\n"),
-  baseSchema: ListObservationsBaseSchema,
-  inputSchema: ListObservationsBaseSchema,
+  baseSchema: ListObservationsBaseSchema as z.ZodType<ListObservationsInput>,
+  inputSchema: ListObservationsInputSchema,
   handler: async (input, context) => {
     return await instrumentAsync(
       { name: "mcp.observations.list", spanKind: SpanKind.INTERNAL },
@@ -95,11 +256,42 @@ export const [listObservationsTool, handleListObservations] = defineTool({
           "mcp.field_groups": fieldGroups.join(","),
         });
 
-        const advancedFilters = input.filter?.map((filter) =>
-          filter.column === "tags"
-            ? { ...filter, column: "traceTags" }
-            : filter,
-        );
+        const advancedFilters = input.filter?.map((filter, index) => {
+          if (
+            typeof filter !== "object" ||
+            filter === null ||
+            Array.isArray(filter)
+          ) {
+            throw new UserInputError(
+              `Invalid filter[${index}]: each filter must be an object, for example ${OBSERVATION_MCP_FILTER_EXAMPLE_JSON}.`,
+            );
+          }
+
+          const filterRecord = filter as Record<string, unknown>;
+          const column = filterRecord.column;
+          if (typeof column !== "string") {
+            throw new UserInputError(
+              `Invalid filter[${index}]: missing string column. Call getObservationFilterSchema for accepted columns.`,
+            );
+          }
+
+          const type =
+            filterRecord.type ??
+            OBSERVATION_MCP_FILTER_COLUMN_TYPES.get(column);
+          const parsedFilter = singleFilter.safeParse(
+            column === "tags"
+              ? { ...filterRecord, type, column: "traceTags" }
+              : { ...filterRecord, type },
+          );
+
+          if (!parsedFilter.success) {
+            throw new UserInputError(
+              `Invalid filter[${index}] for column "${column}". Expected an object matching getObservationFilterSchema; for example ${OBSERVATION_MCP_FILTER_EXAMPLE_WITH_TYPE_JSON}.`,
+            );
+          }
+
+          return parsedFilter.data;
+        });
 
         const items = await getObservationsV2FromEventsTableForPublicApi({
           projectId: context.projectId,
